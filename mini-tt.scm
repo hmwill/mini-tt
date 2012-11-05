@@ -6,10 +6,7 @@
 ;;; "A simple type-theoretic language: Mini-TT", in:
 ;;; "From Seamantics to Computer Sicence", eds. Bertot, Y., Huet, G., Lévy, J.-J., & Plotkin, G.,
 ;;; Cambridge University Press
-
-;(require-for-syntax 'datatype)
-;(require-extension srfi-34)
-
+;;;
 ;;; Mini-TT is given by the following abstract syntax rules:
 ;;;
 ;;; Name:
@@ -44,8 +41,9 @@
 ;;; Branch:
 ;;;   ((Name . Exp) (Name . Exp) ... )
 
-(module ast *
-  (import scheme)
+(module mini-tt *
+  (import (except scheme eval))
+  (import srfi-34)
   (import datatype)
   
   ;;; branches are given as association list of labels to expressions
@@ -60,18 +58,18 @@
     (exp-one)
     (exp-unit)
     (exp-set)
-    (exp-var (name symbol?))
-    (exp-lambda (pattern patt?) (expr exp?))
-    (exp-pi (pattern patt?) (domain exp?) (range exp?))
-    (exp-sigma (pattern patt?) (domain exp?) (range exp?))
-    (exp-make-pair (left exp?) (right exp?))
-    (exp-construct (label symbol?) (expr exp?))
-    (exp-sum (cases branch?))
-    (exp-fun (cases branch?))
-    (exp-fst (expr exp?))
-    (exp-snd (expr exp?))
-    (exp-apply (func exp?) (arg exp?))
-    (exp-let (decl decl?) (body exp?)) )
+    (exp-var        (name symbol?))
+    (exp-lambda     (pattern patt?) (expr exp?))
+    (exp-pi         (pattern patt?) (domain exp?) (range exp?))
+    (exp-sigma      (pattern patt?) (domain exp?) (range exp?))
+    (exp-make-pair  (left exp?) (right exp?))
+    (exp-construct  (label symbol?) (expr exp?))
+    (exp-sum        (cases branch?))
+    (exp-fun        (cases branch?))
+    (exp-fst        (expr exp?))
+    (exp-snd        (expr exp?))
+    (exp-apply      (func exp?) (arg exp?))
+    (exp-let        (decl decl?) (body exp?)) )
   
   ;;; Recursive and non-recursive declarations
   (define-datatype decl decl?
@@ -83,13 +81,6 @@
     (pat-pair (left patt?) (right patt?))
     (pat-blank)
     (pat-var (name symbol?)) )
-)
-
-(module values *
-  (import (except scheme eval))
-  (import srfi-34)
-  (import datatype)
-  (import ast)
   
   ;;; a value
   (define-datatype val val?
@@ -334,27 +325,142 @@
       ((null? e) => e)
       (else (cons (readback-env-entry i (car e)) 
                   (readback-env-entry i (cdr e))))))
-)
-
-(module checker *
-  (import (except scheme eval))
-  (import ast)
-  (import values)
   
-  ;;; check that decl is a valid declaration in the given environment and context.
-  ;;; if this is the case, return the extended context
-  (define (check-decl env context decl)
-    context)
-      
+  ;;; extend the the given context by binding all variable included in the pattern p to their types
+  (define (extend-context context p t v)
+    (cases patt p
+      (pat-pair   (p1 p2)  
+        (cases val t
+          (val-sigma (t g)      (let ((context1 (extend-context p1 t (vfst v))))
+                                  (extend-context context1 p2 (inst g (vfst v)) (vsnd v))))))
+      (pat-blank  ()            context)
+      (pat-var    (x)           ((cons (cons x t) context)))))
+    
+  ;;; check if <p:a b> qualified by pi or sigma form a valid type in the given context and environment
+  (define (check-is-pi-sigma-type? env context l p a b)
+    (and
+      (check-is-type? env context l a)
+      ((let ((context0  (extend-context context p (eval a env) (val-accum (acc-var l))))
+             (env0      (cons (env-val p (val-accum (acc-var l))) env)))
+          (check-is-type? (+ l 1) env0 context0 b)))))
+          
   ;;; check if expr denotes a type using the given environment and context
-  (define (check-is-type env context expr)
-    #t)
+  (define (check-is-type? env context l e)
+    (cases exp e
+      (exp-set    ()      #t)
+      (exp-pi     (p a b) (check-is-pi-sigma-type? env context l p a b))
+      (exp-sigma  (p a b) (check-is-pi-sigma-type? env context l p a b))
+      (else               (check-expr-type? env context l e (val-set)))))
+    
+    ;;; check that decl is a valid declaration in the given environment and context.
+    ;;; if this is the case, return the extended context
+    (define (check-decl env context l d)
+      (cases decl d
+        (decl-def (p a e) 
+          (if (check-is-type? env context l a) 
+            (let ((t (eval a env)))
+              (if (check-expr-type? env context l e t) 
+                (extend-context context p t (eval e env)) 
+                (raise "Invalid declaration"))) 
+            (raise "Invalid declaration")))
+        (decl-rec (p a e) 
+          (if (check-is-type? env context l a) 
+            (let* ((t         (eval a env))
+                   (gen       (val-accum (acc-var l)))
+                   (context1  (extend-context context p t gen)))
+                (if (check-expr-type? (+ l 1) 
+                                      (cons (env-val p gen) env) 
+                                      context1 e t)
+                  (let  ((v   (eval e (cons (env-decl d) env))))
+                    (extend-context context p t v))                    
+                  (raise "Invalid declaration")))
+            (raise "Invalid declaration")))))
+      
+  ;;; calculate the normal forms of two type values and test if they are equal
+  (define (equal-normal-type? i v1 v2)
+    (equal? (readback-value i v1)
+            (readback-value i v2)))
+            
+  ;;; check that a sigma or pi expr matches a type in the given environment and context
+  (define (check-sigma-pi-expr-type? env context l p a b t)
+    (if (check-expr-type? env context l a (val-set))
+      (let* ((gen       (val-accum (acc-var l)))
+             (context1  (extend-context context p (eval a env) gen)))
+        (check-expr-type? (cons (env-val p gen) env) context1 b (val-set)))
+      (raise "Type mismatch")))
     
   ;;; check that expr matches a type in the given environment and context
-  (define (check-expr-type env context expr type)
-    #t)
+  (define (check-expr-type? env context l e t)
+    (cases exp e
+      (exp-lambda (p e)
+        (cases val t
+          (val-pi (t g)     (let* ((gen       (val-accum (acc-var l)))
+                                   (context1  (extend-context context p t gen)))
+                              (check-expr-type? (+ l 1) 
+                                               (cons (env-val p gen) env) 
+                                               context1 e (inst g gen))))))
+      (exp-make-pair (e1 e2)
+        (cases val t
+          (val-sigma (t g)  (and (check-expr-type? env context l e1 t)
+                                 (check-expr-type? env context l e2 (inst g (eval e1 env)))))))
+      (exp-construct  (c e)
+        (cases val t
+          (val-sum (cc)     (let* ((cas     (car cc))
+                                   (env1    (cdr cc))
+                                   (a       (cdr (assoc c cas))))  ; TODO: This fails if the label is not found
+                              (check-expr-type? env context l e (eval a env1))))))
+      (exp-unit ()
+        (cases val t        
+          (val-one ()       #t)))
+      (exp-one ()
+        (cases val t        
+          (val-set ()       #t)))
+          
+      (exp-pi (p a b) 
+        (cases val t
+          (val-set ()       (check-sigma-pi-expr-type? env context l p a b t))))
+      (exp-sigma (p a b) 
+        (cases val t
+          (val-set ()       (check-sigma-pi-expr-type? env context l p a b t))))
+      (exp-sum (cas) 
+        (cases val t
+          (val-set ()       (and (map (lambda (a) (check-expr-type? env context l a (val-set))) 
+                                      cas)))))
+      (exp-fun (ces) 
+        (cases val t
+          (val-pi (sum g)
+          (cases val sum
+            (val-sum (cc)   (let* ((cas     (car cc))
+                                   (env1    (cdr cc)))
+                                 (if (equal? (map car ces) (map car cas)) 
+                                   (and (map (lambda (ce ca) 
+                                               (let*  ((c   (car ce))
+                                                       (e   (cdr ce))
+                                                       (a   (cdr ca))
+                                                       (cl  (val-pi (eval a env1) (clos-decon g c))))
+                                                 (check-expr-type? env context l e cl))) 
+                                             ces cas)) 
+                                   (raise "Case labels do not match"))))))))
+                                 
+      (exp-decl (d e)       (let ((context1 (check-decl env context l d)))
+                              (check-expr-type? (cons (env-decl d) env) context1 e t)))
+      
+    (else (equal-normal-type? l t (infer-expr-type env context l e)))))
     
   ;;; infer the type of expr in the given environment and context
-  (define (infer-expr-type env context expr)
-    #t)
+  (define (infer-expr-type env context l e)
+    (cases exp e
+      (exp-var (x)      (cdr (assoc x context)))
+      (exp-app (e1 e2)  (cases val (infer-expr-type env context l e1)
+                          (val-pi (t g) 
+                            (if (check-expr-type? env context l e2 t)
+                              (inst g (eval e2 env))
+                              (raise "Cannot infer type")))))
+      (exp-fst (e)      (cases val (infer-expr-type env context l e)
+                          (val-sigma (a g)
+                            a)))
+      (exp-snd (e)      (cases val (infer-expr-type env context l e)
+                          (val-sigma (a g)
+                            (inst g (vfst (eval e env))))))
+      (else (raise "Cannot infer type"))))
 )
